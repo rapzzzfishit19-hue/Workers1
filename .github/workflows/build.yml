@@ -17,30 +17,43 @@ on:
         description: "Hanya jalankan analyze (true/false)"
         required: false
         default: "false"
-      fast_mode:
-        description: "Mode BUILD CEPAT: arm64 + skip lint + tanpa tree-shake (true/false)"
-        required: false
-        default: "false"
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
+    # WAJIB: biar github.token boleh unduh release asset (hindari 403)
+    permissions:
+      contents: write
+      actions: read
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-
+    
     steps:
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
       - name: Download ZIP project
+        env:
+          # Prefer PAT secret; fallback ke token bawaan Actions
+          DL_TOKEN: ${{ secrets.GH_TOKEN != '' && secrets.GH_TOKEN || github.token }}
         run: |
           echo "=== Downloading ZIP ==="
           echo "URL: ${{ github.event.inputs.zip_url }}"
 
-          curl -L --retry 3 --connect-timeout 20 --max-time 300 \
-            -H "Authorization: Bearer ${{ github.token }}" \
-            -H "Accept: application/octet-stream" \
-            "${{ github.event.inputs.zip_url }}" \
-            -o project.zip \
-            -w "\n=== HTTP Status: %{http_code} ===\n=== Final URL: %{url_effective} ===\n"
+          HTTP_CODE=$(curl -sS -L             -H "Authorization: Bearer $DL_TOKEN"             -H "Accept: application/octet-stream"             -H "X-GitHub-Api-Version: 2022-11-28"             -H "User-Agent: FlutterBuildBot"             "${{ github.event.inputs.zip_url }}"             -o project.zip             -w "%{http_code}")
+
+          echo "HTTP Status: $HTTP_CODE"
+          ls -lh project.zip || true
+          file project.zip || true
+
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "❌ Download gagal (HTTP $HTTP_CODE)"
+            head -c 500 project.zip || true
+            exit 1
+          fi
 
           echo ""
           echo "=== File Info ==="
@@ -48,6 +61,9 @@ jobs:
           echo ""
           echo "=== File Type ==="
           file project.zip
+          echo ""
+          echo "=== First Bytes ==="
+          xxd project.zip | head -2
 
       - name: Extract ZIP
         run: |
@@ -69,7 +85,7 @@ jobs:
           echo "=== Mengunci Project Dir ==="
           SUB_DIR_COUNT=$(find project_raw -maxdepth 1 -mindepth 1 -type d | wc -l)
           FILE_COUNT=$(find project_raw -maxdepth 1 -mindepth 1 -type f | wc -l)
-
+          
           if [ "$SUB_DIR_COUNT" -eq 1 ] && [ "$FILE_COUNT" -eq 0 ]; then
             PROJECT_DIR=$(find project_raw -maxdepth 1 -mindepth 1 -type d | head -n 1)
           else
@@ -90,22 +106,7 @@ jobs:
           channel: "stable"
           cache: true
 
-      - name: Fast mode - skip lint
-        if: ${{ github.event.inputs.fast_mode == 'true' }}
-        run: |
-          mkdir -p ~/.gradle/init.d
-          cat > ~/.gradle/init.d/fast.gradle <<'GINIT'
-          allprojects {
-            tasks.whenTaskAdded { task ->
-              if (task.name.startsWith("lint") || task.name.contains("lintVital") || task.name.contains("LintVital")) {
-                task.enabled = false
-              }
-            }
-          }
-          GINIT
-
       - name: Analyze Project Code
-        if: ${{ github.event.inputs.only_analyze == 'true' }}
         working-directory: ${{ env.PROJECT_DIR }}
         run: |
           if [ -f "pubspec.yaml" ]; then
@@ -135,14 +136,7 @@ jobs:
         working-directory: ${{ env.PROJECT_DIR }}
         run: |
           if [ -f "pubspec.yaml" ]; then
-            EXTRA=""
-            if [ "${{ github.event.inputs.fast_mode }}" = "true" ]; then
-              EXTRA="--target-platform android-arm64 --no-pub"
-              if [ "${{ github.event.inputs.build_type }}" = "release" ]; then
-                EXTRA="$EXTRA --no-tree-shake-icons"
-              fi
-            fi
-            flutter build apk --${{ github.event.inputs.build_type }} $EXTRA
+            flutter build apk --${{ github.event.inputs.build_type }}
           else
             GRADLE_PATH=$(find . -name "gradlew" | head -n 1)
             GRADLE_DIR=$(dirname "$GRADLE_PATH")
@@ -167,5 +161,4 @@ jobs:
           name: flutter-${{ github.event.inputs.build_type }}-${{ github.event.inputs.tag }}
           path: ${{ env.PROJECT_DIR }}/${{ env.APK_PATH }}
           retention-days: 1
-          compression-level: 0
           if-no-files-found: error
